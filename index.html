@@ -551,7 +551,7 @@
       <i style="font-style:normal">🎨</i> تغيير القالب
     </span>
     <button class="btn btn-ghost" onclick="resetForm()">🔄 إعادة تعيين</button>
-    <button class="btn btn-ghost" onclick="window.print()">🖨️ طباعة</button>
+    <button class="btn btn-ghost" onclick="smartPrint()">🖨️ طباعة</button>
     <button class="btn btn-primary" onclick="exportPDF()">📥 تصدير PDF</button>
   </div>
 </div>
@@ -1113,7 +1113,9 @@ function preloadImage(src){
 // هذا الحل يتجاوز كل مشاكل dom-to-image و html2canvas على iOS
 function drawPDFCanvas(){
   return new Promise(function(resolve, reject){
-    var SCALE = 2; // 2x لجودة جيدة
+    // === جودة عالية: 3x DPI ===
+    // 794×1123×9 = ~8M pixels - ضمن حدود iOS Safari الآمنة
+    var SCALE = 3;
     var W = 794 * SCALE;
     var H = 1123 * SCALE;
     
@@ -1121,6 +1123,11 @@ function drawPDFCanvas(){
     canvas.width = W;
     canvas.height = H;
     var ctx = canvas.getContext('2d');
+    
+    // === تحسينات الجودة ===
+    // imageSmoothingEnabled مع quality عالية = صور أنعم وأوضح
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     
     // خلفية بيضاء
     ctx.fillStyle = '#ffffff';
@@ -1557,7 +1564,9 @@ function isCenterAligned(key){
 }
 
 // ============ تصدير PDF (يعمل على الكمبيوتر والجوال) ============
-function exportPDF(){
+// ============ توليد PDF (مشترك بين التصدير والطباعة) ============
+function generatePDF(action){
+  // action: 'save' أو 'print'
   var page = document.getElementById('page');
   var oldScale = pageScale;
   var mobile = isMobileDevice();
@@ -1580,13 +1589,11 @@ function exportPDF(){
   var capturePromise;
   
   if(mobile){
-    // === الحل الجذري للجوال: رسم Canvas يدوياً ===
     capturePromise = new Promise(function(r){ setTimeout(r, 200); })
       .then(function(){
         return drawPDFCanvas();
       });
   } else {
-    // === على الكمبيوتر: dom-to-image-more (نفس السابق) ===
     capturePromise = new Promise(function(r){ setTimeout(r, 300); })
       .then(function(){
         var DPI_SCALE = 3;
@@ -1606,7 +1613,7 @@ function exportPDF(){
       });
   }
   
-  capturePromise.then(function(dataUrl){
+  return capturePromise.then(function(dataUrl){
     if(!dataUrl || dataUrl.length < 1000){
       throw new Error('الصورة المُلتقطة فارغة');
     }
@@ -1617,11 +1624,63 @@ function exportPDF(){
     pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'FAST');
     
     var name = (document.getElementById('f_title').value || 'تقرير') + '.pdf';
-    pdf.save(name);
+    
+    if(action === 'save'){
+      pdf.save(name);
+    } else if(action === 'print'){
+      // === فتح PDF في تبويب جديد للطباعة ===
+      // هذا الحل أكثر موثوقية من window.print() على الجوال
+      // لأن المستخدم يطبع من تطبيق PDF الذي يحدد A4 بشكل صحيح
+      var blob = pdf.output('blob');
+      var blobUrl = URL.createObjectURL(blob);
+      
+      // على الجوال: نفتح PDF في تبويب جديد
+      // على الكمبيوتر: نفتح PDF في iframe ونطبع تلقائياً
+      if(mobile){
+        // فتح PDF في تبويب جديد
+        var win = window.open(blobUrl, '_blank');
+        if(!win){
+          // إذا فشل الفتح، نحفظ الـ PDF بدلاً من ذلك
+          pdf.save(name);
+          alert('تم حفظ الملف. افتحه واضغط طباعة من تطبيق عرض PDF.');
+        }
+        // تنظيف الـ URL بعد فترة
+        setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 60000);
+      } else {
+        // على الكمبيوتر: نستخدم iframe للطباعة المباشرة
+        var iframe = document.createElement('iframe');
+        iframe.style.position = 'fixed';
+        iframe.style.right = '0';
+        iframe.style.bottom = '0';
+        iframe.style.width = '0';
+        iframe.style.height = '0';
+        iframe.style.border = '0';
+        iframe.src = blobUrl;
+        document.body.appendChild(iframe);
+        
+        iframe.onload = function(){
+          setTimeout(function(){
+            try {
+              iframe.contentWindow.focus();
+              iframe.contentWindow.print();
+            } catch(e){
+              console.error('Print error:', e);
+              window.open(blobUrl, '_blank');
+            }
+          }, 500);
+          
+          // تنظيف بعد فترة
+          setTimeout(function(){
+            document.body.removeChild(iframe);
+            URL.revokeObjectURL(blobUrl);
+          }, 60000);
+        };
+      }
+    }
     
   }).catch(function(err){
-    console.error('PDF Export Error:', err);
-    alert('حدث خطأ أثناء التصدير: ' + (err.message || 'خطأ غير معروف'));
+    console.error('PDF Generation Error:', err);
+    alert('حدث خطأ: ' + (err.message || 'خطأ غير معروف'));
   }).then(function(){
     page.classList.add('edit-mode');
     document.getElementById('floatBar').classList.remove('hidden');
@@ -1629,6 +1688,18 @@ function exportPDF(){
     document.documentElement.style.setProperty('--page-scale', oldScale);
     document.getElementById('loadingOverlay').classList.remove('show');
   });
+}
+
+// ============ تصدير PDF (يحفظ الملف) ============
+function exportPDF(){
+  generatePDF('save');
+}
+
+// ============ طباعة ذكية ============
+// تستخدم نفس آلية تصدير PDF (Canvas يدوي على الجوال)
+// ثم تفتح الـ PDF للطباعة - هذا أكثر موثوقية من window.print() على الجوال
+function smartPrint(){
+  generatePDF('print');
 }
 
 // ============ Fallback: html2canvas (يُحمَّل ديناميكياً عند الحاجة) ============
