@@ -1029,6 +1029,437 @@ function forceReloadImages(container){
 }
 
 // ============ تصدير PDF (يعمل على الكمبيوتر والجوال) ============
+// ============ تحميل الصور كـ Image objects (مضمونة) ============
+// نحول كل الصور لكائنات Image جاهزة قبل البدء بالرسم
+function preloadImage(src){
+  return new Promise(function(resolve, reject){
+    if(!src){ resolve(null); return; }
+    var img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = function(){
+      if(typeof img.decode === 'function'){
+        img.decode().then(function(){ resolve(img); }).catch(function(){ resolve(img); });
+      } else {
+        resolve(img);
+      }
+    };
+    img.onerror = function(){ resolve(null); };
+    img.src = src;
+    // timeout
+    setTimeout(function(){ if(!img.complete) resolve(null); }, 8000);
+  });
+}
+
+// ============ رسم Canvas يدوياً (الحل الجذري للجوال) ============
+// نرسم صفحة A4 كاملة على Canvas من الصفر، صورة بصورة، نص بنص
+// هذا الحل يتجاوز كل مشاكل dom-to-image و html2canvas على iOS
+function drawPDFCanvas(){
+  return new Promise(function(resolve, reject){
+    var SCALE = 2; // 2x لجودة جيدة
+    var W = 794 * SCALE;
+    var H = 1123 * SCALE;
+    
+    var canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    var ctx = canvas.getContext('2d');
+    
+    // خلفية بيضاء
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
+    
+    // ==== جمع كل الصور المطلوبة ====
+    var headerImg = document.querySelector('.page-header-img');
+    var footerImg = document.querySelector('.page-footer-img');
+    var headerSrc = headerImg ? headerImg.src : null;
+    var footerSrc = footerImg ? footerImg.src : null;
+    
+    // صور الشواهد (نأخذها من imageData مباشرة)
+    var witnessImgs = [];
+    document.querySelectorAll('#page .witness-cell:not(.empty)').forEach(function(cell){
+      var idx = cell.dataset.cell;
+      var handle = cell.querySelector('.img-handle');
+      var img = cell.querySelector('img');
+      if(img && img.src && handle){
+        var inner = cell.querySelector('.inner-frame');
+        var cellRect = inner.getBoundingClientRect();
+        var pageRect = document.getElementById('page').getBoundingClientRect();
+        var hRect = handle.getBoundingClientRect();
+        
+        witnessImgs.push({
+          src: img.src,
+          // إحداثيات الخلية على الصفحة (بالنسبة لـ 794×1123)
+          cellX: (cellRect.left - pageRect.left) / pageScale,
+          cellY: (cellRect.top - pageRect.top) / pageScale,
+          cellW: cellRect.width / pageScale,
+          cellH: cellRect.height / pageScale,
+          // إحداثيات الصورة داخل الخلية
+          imgX: (hRect.left - cellRect.left) / pageScale,
+          imgY: (hRect.top - cellRect.top) / pageScale,
+          imgW: hRect.width / pageScale,
+          imgH: hRect.height / pageScale,
+        });
+      }
+    });
+    
+    // ==== تحميل كل الصور ثم الرسم ====
+    var loadPromises = [
+      preloadImage(headerSrc),
+      preloadImage(footerSrc)
+    ];
+    witnessImgs.forEach(function(w){
+      loadPromises.push(preloadImage(w.src));
+    });
+    
+    Promise.all(loadPromises).then(function(loadedImages){
+      var loadedHeader = loadedImages[0];
+      var loadedFooter = loadedImages[1];
+      var loadedWitnesses = loadedImages.slice(2);
+      
+      try {
+        // === 1. الهيدر: خلفية داكنة ممتدة + صورة الهيدر ===
+        ctx.fillStyle = '#0e3a44';
+        ctx.fillRect(0, 0, W, 155 * SCALE);
+        
+        if(loadedHeader){
+          ctx.drawImage(loadedHeader, 0, 0, W, 150 * SCALE);
+        }
+        
+        // === 2. شارة المدرسة ===
+        var schoolText = 'مدرسة محمد بن القاسم الابتدائية';
+        ctx.font = 'bold ' + (16 * SCALE) + 'px Cairo, Tajawal, Arial';
+        var schoolMetrics = ctx.measureText(schoolText);
+        var schoolPadX = 38 * SCALE;
+        var schoolPadY = 11 * SCALE;
+        var schoolW = schoolMetrics.width + schoolPadX * 2;
+        var schoolH = (16 + 11 * 2) * SCALE;
+        var schoolX = (W - schoolW) / 2;
+        var schoolY = 128 * SCALE;
+        ctx.fillStyle = '#0e3a44';
+        roundRect(ctx, schoolX, schoolY, schoolW, schoolH, 8 * SCALE);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(schoolText, W / 2, schoolY + schoolH / 2);
+        
+        // === 3. شريط العنوان ===
+        var titleText = document.getElementById('p_title').textContent || 'عنوان التقرير';
+        var titleX = 30 * SCALE;
+        var titleY = 225 * SCALE;
+        var titleW = W - 60 * SCALE;
+        var titleH = (12 + 18 + 12) * SCALE; // padding + font-size + padding
+        ctx.fillStyle = '#0e3a44';
+        roundRect(ctx, titleX, titleY, titleW, titleH, 6 * SCALE);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold ' + (18 * SCALE) + 'px Cairo, Tajawal, Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(titleText, W / 2, titleY + titleH / 2);
+        
+        // === 4. شريط أخضر تحت العنوان ===
+        var stripeY = 268 * SCALE;
+        var stripeH = 10 * SCALE;
+        var stripeW = W * 0.38;
+        var stripeGrad = ctx.createLinearGradient(30 * SCALE, 0, 30 * SCALE + stripeW, 0);
+        stripeGrad.addColorStop(0, '#4cc4a8');
+        stripeGrad.addColorStop(0.5, '#3da89a');
+        stripeGrad.addColorStop(1, '#0e3a44');
+        ctx.fillStyle = stripeGrad;
+        ctx.beginPath();
+        ctx.moveTo(30 * SCALE, stripeY);
+        ctx.lineTo(30 * SCALE + stripeW - 6 * SCALE, stripeY);
+        ctx.quadraticCurveTo(30 * SCALE + stripeW, stripeY, 30 * SCALE + stripeW, stripeY + 6 * SCALE);
+        ctx.lineTo(30 * SCALE + stripeW, stripeY + stripeH - 6 * SCALE);
+        ctx.quadraticCurveTo(30 * SCALE + stripeW, stripeY + stripeH, 30 * SCALE + stripeW - 6 * SCALE, stripeY + stripeH);
+        ctx.lineTo(30 * SCALE, stripeY + stripeH);
+        ctx.closePath();
+        ctx.fill();
+        
+        // === 5. الحقول النصية حسب القالب ===
+        if(currentTemplate === 1){
+          drawTemplate1Fields(ctx, SCALE);
+        } else {
+          drawTemplate2Fields(ctx, SCALE);
+        }
+        
+        // === 6. صور الشواهد ===
+        witnessImgs.forEach(function(w, idx){
+          var loadedImg = loadedWitnesses[idx];
+          if(!loadedImg) return;
+          
+          var cx = w.cellX * SCALE;
+          var cy = w.cellY * SCALE;
+          var cw = w.cellW * SCALE;
+          var ch = w.cellH * SCALE;
+          
+          // الإطار الخارجي
+          ctx.strokeStyle = '#3fa292';
+          ctx.lineWidth = 1.5 * SCALE;
+          ctx.fillStyle = '#ffffff';
+          roundRect(ctx, cx, cy, cw, ch, 14 * SCALE);
+          ctx.fill();
+          ctx.stroke();
+          
+          // الإطار الداخلي (مع padding 8)
+          var pad = 8 * SCALE;
+          var ix = cx + pad;
+          var iy = cy + pad;
+          var iw = cw - pad * 2;
+          var ih = ch - pad * 2;
+          
+          // قص للإطار الداخلي ورسم الصورة
+          ctx.save();
+          roundRect(ctx, ix, iy, iw, ih, 10 * SCALE);
+          ctx.clip();
+          
+          // الصورة بإحداثيات حقيقية
+          var imgX = ix + w.imgX * SCALE;
+          var imgY = iy + w.imgY * SCALE;
+          var imgW = w.imgW * SCALE;
+          var imgH = w.imgH * SCALE;
+          ctx.drawImage(loadedImg, imgX, imgY, imgW, imgH);
+          
+          ctx.restore();
+          
+          // الإطار الداخلي
+          ctx.strokeStyle = '#3fa292';
+          ctx.lineWidth = 1.5 * SCALE;
+          roundRect(ctx, ix, iy, iw, ih, 10 * SCALE);
+          ctx.stroke();
+        });
+        
+        // === 7. الفوتر ===
+        if(loadedFooter){
+          ctx.drawImage(loadedFooter, 0, H - 44 * SCALE, W, 44 * SCALE);
+        }
+        
+        // إرجاع الـ Canvas كـ data URL
+        resolve(canvas.toDataURL('image/png', 1.0));
+        
+      } catch(e){
+        reject(e);
+      }
+    }).catch(reject);
+  });
+}
+
+// مساعد لرسم مستطيل بزوايا دائرية
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+// رسم خانة معنونة (إطار + اسم في الأعلى + النص داخلها)
+function drawLabeledBox(ctx, label, content, x, y, w, h, SCALE, alignCenter){
+  // الإطار
+  ctx.strokeStyle = '#3fa292';
+  ctx.lineWidth = 1.5 * SCALE;
+  ctx.fillStyle = '#ffffff';
+  roundRect(ctx, x, y, w, h, 10 * SCALE);
+  ctx.fill();
+  ctx.stroke();
+  
+  // اسم الحقل (يطلع بخلفية بيضاء فوق الإطار)
+  ctx.font = 'bold ' + (13.5 * SCALE) + 'px Tajawal, Arial';
+  var labelMetrics = ctx.measureText(label);
+  var labelW = labelMetrics.width + 24 * SCALE;
+  var labelX = x + w - 18 * SCALE - labelW;
+  var labelY = y - 6 * SCALE;
+  
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(labelX, labelY, labelW, 12 * SCALE);
+  ctx.fillStyle = '#0e3a44';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w - 30 * SCALE, y);
+  
+  // المحتوى
+  if(content && content.trim() && content !== '\u00A0'){
+    ctx.font = (13 * SCALE) + 'px Tajawal, Arial';
+    ctx.fillStyle = '#1a2a30';
+    
+    if(alignCenter){
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      // wrap للنصوص الطويلة
+      drawWrappedText(ctx, content, x + w/2, y + h/2, w - 28 * SCALE, 20 * SCALE, 'center');
+    } else {
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      drawWrappedText(ctx, content, x + w - 14 * SCALE, y + 12 * SCALE, w - 28 * SCALE, 20 * SCALE, 'right');
+    }
+  }
+}
+
+// رسم نص متعدد الأسطر
+function drawWrappedText(ctx, text, x, y, maxW, lineH, align){
+  var lines = text.split('\n');
+  var allLines = [];
+  
+  // wrap كل سطر
+  lines.forEach(function(line){
+    var words = line.split(' ');
+    var currentLine = '';
+    words.forEach(function(word){
+      var test = currentLine ? currentLine + ' ' + word : word;
+      if(ctx.measureText(test).width > maxW && currentLine){
+        allLines.push(currentLine);
+        currentLine = word;
+      } else {
+        currentLine = test;
+      }
+    });
+    if(currentLine) allLines.push(currentLine);
+  });
+  
+  // إذا align center نوسط عمودياً
+  var startY = y;
+  if(align === 'center'){
+    startY = y - (allLines.length - 1) * lineH / 2;
+  }
+  
+  allLines.forEach(function(line, i){
+    ctx.fillText(line, x, startY + i * lineH);
+  });
+}
+
+// رسم حقول القالب 1
+function drawTemplate1Fields(ctx, SCALE){
+  var startY = 300 * SCALE;
+  var leftX = 30 * SCALE;
+  var pageW = 794 * SCALE;
+  var availableW = pageW - 60 * SCALE;
+  
+  // === الصف 1: المنفذ + مكان التنفيذ ===
+  var gap = 16 * SCALE;
+  var executorW = (availableW - gap) * (1.6 / 2.6);
+  var placeW = (availableW - gap) * (1 / 2.6);
+  
+  drawLabeledBox(ctx, 'المنفذ', getValue('executor'), 
+    leftX + placeW + gap, startY, executorW, 46 * SCALE, SCALE,
+    isCenterAligned('executor'));
+  drawLabeledBox(ctx, 'مكان التنفيذ', getValue('place'),
+    leftX, startY, placeW, 46 * SCALE, SCALE,
+    isCenterAligned('place'));
+  
+  // === الصف 2: العمود الأيمن (3 حقول) + الأهداف ===
+  var row2Y = startY + 46 * SCALE + 18 * SCALE;
+  var col2W = (availableW - gap) / 2;
+  var goalsW = (availableW - gap) * (1.05 / 2.05);
+  var rightColW = (availableW - gap) * (1 / 2.05);
+  var goalsH = 200 * SCALE;
+  
+  // العمود الأيمن
+  var rightColX = leftX + goalsW + gap;
+  drawLabeledBox(ctx, 'المستهدفون', getValue('target'),
+    rightColX, row2Y, rightColW, 42 * SCALE, SCALE,
+    isCenterAligned('target'));
+  drawLabeledBox(ctx, 'نسبة المستفيدين', getValue('ratio'),
+    rightColX, row2Y + (42 + 14) * SCALE, rightColW, 42 * SCALE, SCALE,
+    isCenterAligned('ratio'));
+  drawLabeledBox(ctx, 'زمن التنفيذ', getValue('time'),
+    rightColX, row2Y + (42 + 14) * 2 * SCALE, rightColW, 42 * SCALE, SCALE,
+    isCenterAligned('time'));
+  
+  // الأهداف
+  drawLabeledBox(ctx, 'الأهداف', getValue('goals'),
+    leftX, row2Y, goalsW, goalsH, SCALE,
+    isCenterAligned('goals'));
+  
+  // === عنوان "الشواهد" ===
+  var witnessTitleY = 625 * SCALE;
+  ctx.strokeStyle = '#3fa292';
+  ctx.lineWidth = 1.5 * SCALE;
+  ctx.beginPath();
+  ctx.moveTo(leftX, witnessTitleY);
+  ctx.lineTo(leftX + availableW, witnessTitleY);
+  ctx.stroke();
+  
+  ctx.font = 'bold ' + (14 * SCALE) + 'px Tajawal, Arial';
+  ctx.fillStyle = '#ffffff';
+  var labelW = ctx.measureText('الشواهد').width + 36 * SCALE;
+  ctx.fillRect(pageW / 2 - labelW / 2, witnessTitleY - 8 * SCALE, labelW, 16 * SCALE);
+  ctx.fillStyle = '#0e3a44';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('الشواهد', pageW / 2, witnessTitleY);
+  
+  // الدائرة في منتصف شبكة الصور
+  var gridY = witnessTitleY + 14 * SCALE;
+  var gridH = 325 * SCALE;
+  ctx.fillStyle = '#ffffff';
+  ctx.strokeStyle = '#3fa292';
+  ctx.lineWidth = 1.5 * SCALE;
+  ctx.beginPath();
+  ctx.arc(pageW / 2, gridY + gridH / 2, 7 * SCALE, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+}
+
+// رسم حقول القالب 2 (شريط رأسي جانبي)
+function drawTemplate2Fields(ctx, SCALE){
+  var startY = 300 * SCALE;
+  var endY = (1123 - 65) * SCALE;
+  var leftX = 30 * SCALE;
+  var pageW = 794 * SCALE;
+  var availableW = pageW - 60 * SCALE;
+  var gap = 14 * SCALE;
+  
+  // عمود البيانات (يمين، نسبة 1) + شريط الصور (يسار، نسبة 0.65)
+  var dataW = availableW * (1 / 1.65);
+  var photosW = availableW * (0.65 / 1.65);
+  var dataX = leftX + photosW + gap;
+  
+  // === عمود البيانات ===
+  var fieldGap = 14 * SCALE;
+  var fieldH = 42 * SCALE;
+  var totalGap = fieldGap * 5;
+  var goalsBoxH = endY - startY - fieldH * 5 - totalGap;
+  
+  var fields = [
+    {label: 'المنفذ', key: 'executor'},
+    {label: 'مكان التنفيذ', key: 'place'},
+    {label: 'المستهدفون', key: 'target'},
+    {label: 'نسبة المستفيدين', key: 'ratio'},
+    {label: 'زمن التنفيذ', key: 'time'},
+  ];
+  
+  var currentY = startY;
+  fields.forEach(function(f){
+    drawLabeledBox(ctx, f.label, getValue(f.key),
+      dataX, currentY, dataW, fieldH, SCALE,
+      isCenterAligned(f.key));
+    currentY += fieldH + fieldGap;
+  });
+  
+  // الأهداف
+  drawLabeledBox(ctx, 'الأهداف', getValue('goals'),
+    dataX, currentY, dataW, endY - currentY, SCALE,
+    isCenterAligned('goals'));
+}
+
+// helpers
+function getValue(key){
+  var input = document.getElementById('f_' + key);
+  return input ? input.value : '';
+}
+function isCenterAligned(key){
+  var box = document.querySelector('.lbl-box .box[data-field="' + key + '"]');
+  return box ? box.classList.contains('align-center') : false;
+}
+
+// ============ تصدير PDF (يعمل على الكمبيوتر والجوال) ============
 function exportPDF(){
   var page = document.getElementById('page');
   var oldScale = pageScale;
@@ -1043,97 +1474,58 @@ function exportPDF(){
   var tbs = page.querySelectorAll('.img-toolbar, .resize-h');
   tbs.forEach(function(t){ t.style.display='none'; });
   
-  // === مهم على iOS: نحذف عناصر القالب المخفي مؤقتاً من DOM ===
-  // (إخفاؤها بـ display:none لا يكفي - iOS لا يزال يحجز ذاكرة لها)
-  // نحفظها في متغير لإرجاعها لاحقاً
-  var hiddenContent = null;
-  var hiddenParent = null;
-  var hiddenNextSibling = null;
-  
-  if(currentTemplate === 1){
-    hiddenContent = document.querySelector('.t2-content');
-  } else {
-    hiddenContent = document.querySelector('.t1-content');
-  }
-  
-  if(hiddenContent){
-    hiddenParent = hiddenContent.parentNode;
-    hiddenNextSibling = hiddenContent.nextSibling;
-    hiddenParent.removeChild(hiddenContent);
-  }
-  
   document.getElementById('loadingOverlay').classList.add('show');
   
-  // === الخطوات بالترتيب: ===
-  // 1. إعادة تحميل صور القالب الحالي (للتأكد إنها كاملة في الذاكرة)
-  // 2. انتظار decode() لكل صورة
-  // 3. تأخير إضافي 500ms لـ render
-  // 4. الالتقاط
+  // === الاستراتيجية: ===
+  // على الكمبيوتر: نستخدم dom-to-image-more للجودة العالية والدقة
+  // على الجوال: نرسم Canvas يدوياً بأنفسنا - مضمون 100%
   
-  forceReloadImages(page).then(function(){
-    return waitForImages(page);
-  }).then(function(){
-    // تأخير إضافي لضمان render كامل (مهم على iOS)
-    return new Promise(function(r){ setTimeout(r, mobile ? 600 : 300); });
-  }).then(function(){
+  var capturePromise;
+  
+  if(mobile){
+    // === الحل الجذري للجوال: رسم Canvas يدوياً ===
+    capturePromise = new Promise(function(r){ setTimeout(r, 200); })
+      .then(function(){
+        return drawPDFCanvas();
+      });
+  } else {
+    // === على الكمبيوتر: dom-to-image-more (نفس السابق) ===
+    capturePromise = new Promise(function(r){ setTimeout(r, 300); })
+      .then(function(){
+        var DPI_SCALE = 3;
+        return domtoimage.toPng(page, {
+          width: 794 * DPI_SCALE,
+          height: 1123 * DPI_SCALE,
+          style: {
+            transform: 'scale(' + DPI_SCALE + ')',
+            transformOrigin: 'top left',
+            width: '794px',
+            height: '1123px'
+          },
+          quality: 1.0,
+          bgcolor: '#ffffff',
+          cacheBust: false
+        });
+      });
+  }
+  
+  capturePromise.then(function(dataUrl){
+    if(!dataUrl || dataUrl.length < 1000){
+      throw new Error('الصورة المُلتقطة فارغة');
+    }
     
-    // === على الجوال: نستخدم scale أقل لتجنب مشكلة Canvas size ===
-    // iOS Safari max canvas: ~16M pixels
-    var DPI_SCALE = mobile ? 2 : 3;
-    var targetW = 794 * DPI_SCALE;
-    var targetH = 1123 * DPI_SCALE;
-    
-    return domtoimage.toPng(page, {
-      width: targetW,
-      height: targetH,
-      style: {
-        transform: 'scale(' + DPI_SCALE + ')',
-        transformOrigin: 'top left',
-        width: '794px',
-        height: '1123px'
-      },
-      quality: 1.0,
-      bgcolor: '#ffffff',
-      cacheBust: false,
-      imagePlaceholder: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-    }).then(function(dataUrl){
-      if(!dataUrl || dataUrl.length < 1000){
-        throw new Error('الصورة المُلتقطة فارغة');
-      }
-      return dataUrl;
-    }).catch(function(err){
-      console.warn('dom-to-image فشل، نستخدم html2canvas:', err);
-      return loadHtml2CanvasFallback(page, mobile);
-    });
-    
-  }).then(function(dataUrl){
     var pdf = new jspdf.jsPDF('p','mm','a4');
     var pdfW = pdf.internal.pageSize.getWidth();
     var pdfH = pdf.internal.pageSize.getHeight();
-    
-    if(mobile){
-      pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'MEDIUM');
-    } else {
-      pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'FAST');
-    }
+    pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'FAST');
     
     var name = (document.getElementById('f_title').value || 'تقرير') + '.pdf';
     pdf.save(name);
     
   }).catch(function(err){
     console.error('PDF Export Error:', err);
-    alert('حدث خطأ أثناء التصدير: ' + (err.message || 'خطأ غير معروف') + '\\n\\nنصيحة: جرب تقليل عدد الصور أو حجمها.');
+    alert('حدث خطأ أثناء التصدير: ' + (err.message || 'خطأ غير معروف'));
   }).then(function(){
-    // === استعادة كل شي ===
-    // إعادة العنصر المخفي إلى DOM
-    if(hiddenContent && hiddenParent){
-      if(hiddenNextSibling){
-        hiddenParent.insertBefore(hiddenContent, hiddenNextSibling);
-      } else {
-        hiddenParent.appendChild(hiddenContent);
-      }
-    }
-    
     page.classList.add('edit-mode');
     document.getElementById('floatBar').classList.remove('hidden');
     tbs.forEach(function(t){ t.style.display=''; });
