@@ -952,22 +952,80 @@ function isIOS(){
   return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
 }
 
-// ============ تحضير الصور قبل الالتقاط ============
-// المشكلة: dom-to-image على iOS أحياناً يفشل في تضمين صور Base64 الكبيرة
-// الحل: ننتظر تحميل كل الصور قبل الالتقاط
+// ============ تحضير الصور قبل الالتقاط (نسخة قوية لـ iOS) ============
+// المشكلة المُكتشَفة: على iOS Safari، الصور <img> في DOM لا تُحمَّل دفعة واحدة
+// لتوفير الذاكرة - فعند التصدير، الالتقاط يطلع ناقص لأن بعض الصور لسه ما حُمّلت
+// الحل: نجبر تحميل كل الصور فعلياً عبر Image() + decode() في الذاكرة قبل الالتقاط
 function waitForImages(container){
   var imgs = container.querySelectorAll('img');
   var promises = [];
+  
   imgs.forEach(function(img){
-    if(img.complete && img.naturalWidth > 0) return;
+    // نتأكد من src
+    var src = img.src || img.getAttribute('src');
+    if(!src) return;
+    
     promises.push(new Promise(function(resolve){
-      img.onload = resolve;
-      img.onerror = resolve;
-      // timeout سريع كاحتياط
-      setTimeout(resolve, 2000);
+      // نسوي صورة جديدة في الذاكرة وننتظر تحميلها كاملة
+      var preloader = new Image();
+      
+      // إذا الصورة عندها decode() نستخدمها (مضمونة 100%)
+      preloader.onload = function(){
+        if(typeof preloader.decode === 'function'){
+          preloader.decode().then(resolve).catch(resolve);
+        } else {
+          resolve();
+        }
+      };
+      preloader.onerror = function(){ resolve(); };
+      preloader.src = src;
+      
+      // إذا كانت محملة فعلاً، resolve فوراً
+      if(preloader.complete && preloader.naturalWidth > 0){
+        if(typeof preloader.decode === 'function'){
+          preloader.decode().then(resolve).catch(resolve);
+        } else {
+          resolve();
+        }
+      }
+      
+      // timeout كاحتياط (5 ثواني)
+      setTimeout(resolve, 5000);
     }));
   });
+  
   return Promise.all(promises);
+}
+
+// ============ إعادة تحميل صور القالب الحالي قبل التصدير ============
+// هذا يجبر iOS على إعادة تحميل أي صور قد لا تكون كاملة في الذاكرة
+function forceReloadImages(container){
+  return new Promise(function(resolve){
+    var imgs = container.querySelectorAll('img');
+    var pending = imgs.length;
+    if(pending === 0){ resolve(); return; }
+    
+    imgs.forEach(function(img){
+      var originalSrc = img.src;
+      // إعادة تعيين src يجبر المتصفح على إعادة التحميل
+      img.onload = function(){
+        if(--pending === 0) resolve();
+      };
+      img.onerror = function(){
+        if(--pending === 0) resolve();
+      };
+      // trick لإجبار إعادة التحميل
+      if(originalSrc){
+        img.src = '';
+        img.src = originalSrc;
+      } else {
+        if(--pending === 0) resolve();
+      }
+    });
+    
+    // timeout كاحتياط
+    setTimeout(resolve, 8000);
+  });
 }
 
 // ============ تصدير PDF (يعمل على الكمبيوتر والجوال) ============
@@ -985,25 +1043,45 @@ function exportPDF(){
   var tbs = page.querySelectorAll('.img-toolbar, .resize-h');
   tbs.forEach(function(t){ t.style.display='none'; });
   
+  // === مهم على iOS: نحذف عناصر القالب المخفي مؤقتاً من DOM ===
+  // (إخفاؤها بـ display:none لا يكفي - iOS لا يزال يحجز ذاكرة لها)
+  // نحفظها في متغير لإرجاعها لاحقاً
+  var hiddenContent = null;
+  var hiddenParent = null;
+  var hiddenNextSibling = null;
+  
+  if(currentTemplate === 1){
+    hiddenContent = document.querySelector('.t2-content');
+  } else {
+    hiddenContent = document.querySelector('.t1-content');
+  }
+  
+  if(hiddenContent){
+    hiddenParent = hiddenContent.parentNode;
+    hiddenNextSibling = hiddenContent.nextSibling;
+    hiddenParent.removeChild(hiddenContent);
+  }
+  
   document.getElementById('loadingOverlay').classList.add('show');
   
-  // ننتظر الصور أولاً، ثم نلتقط
-  waitForImages(page).then(function(){
-    // تأخير إضافي لضمان الـ render الكامل
-    return new Promise(function(r){ setTimeout(r, 300); });
+  // === الخطوات بالترتيب: ===
+  // 1. إعادة تحميل صور القالب الحالي (للتأكد إنها كاملة في الذاكرة)
+  // 2. انتظار decode() لكل صورة
+  // 3. تأخير إضافي 500ms لـ render
+  // 4. الالتقاط
+  
+  forceReloadImages(page).then(function(){
+    return waitForImages(page);
+  }).then(function(){
+    // تأخير إضافي لضمان render كامل (مهم على iOS)
+    return new Promise(function(r){ setTimeout(r, mobile ? 600 : 300); });
   }).then(function(){
     
     // === على الجوال: نستخدم scale أقل لتجنب مشكلة Canvas size ===
     // iOS Safari max canvas: ~16M pixels
-    // 794 × 1123 × 2 × 2 = ~3.6M pixels (آمن)
-    // 794 × 1123 × 3 × 3 = ~8M pixels (قد يفشل على iOS)
     var DPI_SCALE = mobile ? 2 : 3;
     var targetW = 794 * DPI_SCALE;
     var targetH = 1123 * DPI_SCALE;
-    
-    // === الاستراتيجية الذكية ===
-    // 1. على الكمبيوتر: dom-to-image-more (أفضل للعربي)
-    // 2. على الجوال: نجرب dom-to-image أولاً، وإذا فشل نستخدم html2canvas
     
     return domtoimage.toPng(page, {
       width: targetW,
@@ -1016,17 +1094,14 @@ function exportPDF(){
       },
       quality: 1.0,
       bgcolor: '#ffffff',
-      cacheBust: false,  // مهم على iOS - cacheBust يكسر تحميل data URLs
-      // imagePlaceholder يضمن استبدال أي صورة فاشلة بأبيض شفاف
+      cacheBust: false,
       imagePlaceholder: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
     }).then(function(dataUrl){
-      // التحقق من أن الصورة تم إنشاؤها فعلاً (أكبر من 1KB)
       if(!dataUrl || dataUrl.length < 1000){
         throw new Error('الصورة المُلتقطة فارغة');
       }
       return dataUrl;
     }).catch(function(err){
-      // إذا فشل dom-to-image، نحمل html2canvas ديناميكياً ونستخدمه كـ fallback
       console.warn('dom-to-image فشل، نستخدم html2canvas:', err);
       return loadHtml2CanvasFallback(page, mobile);
     });
@@ -1036,10 +1111,7 @@ function exportPDF(){
     var pdfW = pdf.internal.pageSize.getWidth();
     var pdfH = pdf.internal.pageSize.getHeight();
     
-    // على الجوال نستخدم JPEG بضغط معقول لتقليل حجم الذاكرة
-    // على الكمبيوتر PNG للحفاظ على الجودة
     if(mobile){
-      // نحول PNG لـ JPEG على الجوال لتقليل الحجم
       pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'MEDIUM');
     } else {
       pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH, undefined, 'FAST');
@@ -1052,7 +1124,16 @@ function exportPDF(){
     console.error('PDF Export Error:', err);
     alert('حدث خطأ أثناء التصدير: ' + (err.message || 'خطأ غير معروف') + '\\n\\nنصيحة: جرب تقليل عدد الصور أو حجمها.');
   }).then(function(){
-    // استعادة الإعدادات (دائماً)
+    // === استعادة كل شي ===
+    // إعادة العنصر المخفي إلى DOM
+    if(hiddenContent && hiddenParent){
+      if(hiddenNextSibling){
+        hiddenParent.insertBefore(hiddenContent, hiddenNextSibling);
+      } else {
+        hiddenParent.appendChild(hiddenContent);
+      }
+    }
+    
     page.classList.add('edit-mode');
     document.getElementById('floatBar').classList.remove('hidden');
     tbs.forEach(function(t){ t.style.display=''; });
